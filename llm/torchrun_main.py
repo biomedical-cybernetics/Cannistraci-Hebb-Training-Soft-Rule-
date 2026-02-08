@@ -19,14 +19,17 @@ import math
 import random
 import argparse
 import traceback
+import contextlib
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 import transformers
@@ -51,6 +54,146 @@ from utils import *  # noqa: F403,F401
 from dst_scheduler import DSTScheduler
 
 transformers.logging.set_verbosity_error()
+
+
+SUPPORTED_PRECISION_NAMES = {
+    "float32": "fp32",
+    "fp32": "fp32",
+    "float16": "fp16",
+    "half": "fp16",
+    "fp16": "fp16",
+    "bfloat16": "bf16",
+    "bf16": "bf16",
+}
+
+
+def normalize_precision_name(value: str) -> str:
+    key = value.strip().lower()
+    if key not in SUPPORTED_PRECISION_NAMES:
+        raise ValueError(f"Unsupported precision: {value}")
+    return SUPPORTED_PRECISION_NAMES[key]
+
+
+def torch_dtype_from_name(value: str) -> torch.dtype:
+    name = normalize_precision_name(value)
+    if name == "fp32":
+        return torch.float32
+    if name == "fp16":
+        return torch.float16
+    if name == "bf16":
+        return torch.bfloat16
+    raise ValueError(f"Unsupported precision name: {value}")
+
+
+def parse_bool_like(value: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Invalid bool-like value: {value}")
+
+
+class SymmetricFakeQuantizer(nn.Module):
+    """Simple STE fake quantizer used for lightweight QAT."""
+
+    def __init__(
+        self,
+        bits: int = 8,
+        mode: str = "per_tensor",
+        channel_axis: int = 0,
+        eps: float = 1e-8,
+    ):
+        super().__init__()
+        self.bits = bits
+        self.mode = mode
+        self.channel_axis = channel_axis
+        self.eps = eps
+        self.enabled = True
+        self.observer_enabled = True
+        self.register_buffer("scale", torch.tensor(1.0), persistent=False)
+        self._initialized = False
+
+    def _calc_scale(self, x: torch.Tensor) -> torch.Tensor:
+        qmax = (1 << (self.bits - 1)) - 1
+        if self.mode == "per_channel":
+            reduce_dims = [i for i in range(x.dim()) if i != self.channel_axis]
+            max_abs = x.abs().amax(dim=reduce_dims, keepdim=True)
+        elif self.mode == "per_token":
+            if x.dim() < 2:
+                max_abs = x.abs().amax().reshape(1)
+            else:
+                max_abs = x.abs().amax(dim=-1, keepdim=True)
+        else:
+            max_abs = x.abs().amax().reshape(1)
+        return (max_abs / float(qmax)).clamp_min(self.eps)
+
+    def _maybe_update_observer(self, x: torch.Tensor) -> None:
+        current_scale = self._calc_scale(x).detach()
+        if (not self._initialized) or self.scale.shape != current_scale.shape:
+            self.scale = current_scale
+            self._initialized = True
+        else:
+            self.scale = torch.maximum(self.scale, current_scale)
+
+    def quantize_dequantize(self, x: torch.Tensor) -> torch.Tensor:
+        qmax = (1 << (self.bits - 1)) - 1
+        qmin = -qmax
+        scale = self.scale.to(device=x.device, dtype=x.dtype)
+        q = torch.clamp(torch.round(x / scale), qmin, qmax)
+        return q * scale
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.enabled:
+            return x
+        if self.observer_enabled or (not self._initialized):
+            self._maybe_update_observer(x)
+        x_dq = self.quantize_dequantize(x)
+        return x + (x_dq - x).detach()
+
+
+class QATLinear(nn.Module):
+    def __init__(
+        self,
+        linear: nn.Linear,
+        act_granularity: str = "per_tensor",
+        weight_granularity: str = "per_channel",
+    ):
+        super().__init__()
+        self.linear = linear
+        weight_mode = "per_channel" if weight_granularity == "per_channel" else "per_tensor"
+        act_mode = "per_token" if act_granularity == "per_token" else "per_tensor"
+        self.weight_fake_quant = SymmetricFakeQuantizer(bits=8, mode=weight_mode, channel_axis=0)
+        self.act_fake_quant = SymmetricFakeQuantizer(bits=8, mode=act_mode, channel_axis=-1)
+
+    def set_qat_state(self, *, enabled: bool, observer_enabled: bool) -> None:
+        self.weight_fake_quant.enabled = enabled
+        self.act_fake_quant.enabled = enabled
+        self.weight_fake_quant.observer_enabled = observer_enabled
+        self.act_fake_quant.observer_enabled = observer_enabled
+
+    def export_as_linear(self) -> nn.Linear:
+        quant_weight = self.weight_fake_quant.quantize_dequantize(self.linear.weight.detach())
+        out_features = self.linear.out_features
+        in_features = self.linear.in_features
+        has_bias = self.linear.bias is not None
+        exported = nn.Linear(
+            in_features=in_features,
+            out_features=out_features,
+            bias=has_bias,
+            device=self.linear.weight.device,
+            dtype=self.linear.weight.dtype,
+        )
+        with torch.no_grad():
+            exported.weight.copy_(quant_weight)
+            if has_bias:
+                exported.bias.copy_(self.linear.bias.detach())
+        return exported
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_q = self.act_fake_quant(x)
+        w_q = self.weight_fake_quant(self.linear.weight)
+        return F.linear(x_q, w_q, self.linear.bias)
 
 
 # -------------------------
@@ -172,6 +315,57 @@ def build_run_name(args: argparse.Namespace) -> str:
     return suffix
 
 
+def normalize_precision_runtime_args(args: argparse.Namespace) -> None:
+    # backward-compatible alias: --dtype drives compute precision unless --compute_dtype is set
+    legacy_compute_dtype = normalize_precision_name(args.dtype)
+    args.compute_dtype = normalize_precision_name(args.compute_dtype or legacy_compute_dtype)
+
+    if args.master_weight_dtype is None:
+        args.master_weight_dtype = "fp32"
+    else:
+        args.master_weight_dtype = normalize_precision_name(args.master_weight_dtype)
+
+    args.grad_dtype = normalize_precision_name(args.grad_dtype)
+    if args.grad_dtype not in {"fp32", "fp16"}:
+        raise ValueError(f"grad_dtype must be fp32 or fp16, got {args.grad_dtype}")
+
+    # keep behavior predictable: optimizer math needs grad dtype compatible with master weights
+    if args.master_weight_dtype == "fp32" and args.grad_dtype == "fp16":
+        args.grad_dtype = "fp32"
+    if args.master_weight_dtype == "fp16" and args.grad_dtype == "fp32":
+        args.grad_dtype = "fp16"
+
+    args.amp = parse_bool_like(args.amp)
+    if args.compute_dtype == "fp32":
+        args.amp = False
+
+    if args.grad_scaler == "auto":
+        args.use_grad_scaler = args.amp and args.compute_dtype == "fp16"
+    elif args.grad_scaler == "on":
+        args.use_grad_scaler = True
+    else:
+        args.use_grad_scaler = False
+
+    if args.use_grad_scaler and (args.compute_dtype != "fp16" or not args.amp):
+        raise ValueError("grad_scaler=on requires amp=true and compute_dtype=fp16")
+
+    args.quant_mode = args.quant_mode.lower()
+    args.target_infer_dtype = args.target_infer_dtype.lower()
+    args.quant_exclude_list = [x.strip() for x in args.quant_exclude.split(",") if x.strip()]
+    args.export_format = args.export_format.lower()
+    args.export_fallback_dtype = normalize_precision_name(args.export_fallback_dtype)
+
+    if args.optimizer_state_dtype == "int8" and args.optimizer not in {"adam", "adamw"}:
+        raise ValueError("optimizer_state_dtype=int8 currently supports adam/adamw only")
+
+    if not (0.0 <= args.qat_start_ratio <= 1.0):
+        raise ValueError("qat_start_ratio should be in [0, 1]")
+    if not (0.0 <= args.qat_freeze_observer_ratio <= 1.0):
+        raise ValueError("qat_freeze_observer_ratio should be in [0, 1]")
+    if args.qat_start_ratio > args.qat_freeze_observer_ratio:
+        raise ValueError("qat_start_ratio must be <= qat_freeze_observer_ratio")
+
+
 # -------------------------
 # CLI
 # -------------------------
@@ -207,12 +401,36 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--save_dir", type=str, default=None, help="Base output dir. If None, derived from run name.")
     p.add_argument("--only_save_last", action="store_true", default=False)
     p.add_argument("--dtype", type=str, default="bfloat16" if torch.cuda.is_bf16_supported() else "float32",
-                   choices=["float32", "bfloat16", "bf16"])
+                   choices=["float32", "bfloat16", "bf16", "float16", "fp16"])
+    p.add_argument("--compute_dtype", type=str, default=None,
+                   choices=["float32", "fp32", "bfloat16", "bf16", "float16", "fp16"])
+    p.add_argument("--master_weight_dtype", type=str, default=None,
+                   choices=["float32", "fp32", "bfloat16", "bf16", "float16", "fp16"])
+    p.add_argument("--grad_dtype", type=str, default="fp32",
+                   choices=["float32", "fp32", "float16", "fp16"])
+    p.add_argument("--optimizer_state_dtype", type=str, default="fp32", choices=["fp32", "int8"])
+    p.add_argument("--amp", type=str, default="true", choices=["true", "false"])
+    p.add_argument("--grad_scaler", type=str, default="auto", choices=["auto", "on", "off"])
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--grad_clipping", type=float, default=0.0)
     p.add_argument("--scheduler", type=str, default="cosine_restarts", choices=["linear", "cosine", "cosine_restarts"])
     p.add_argument("--beta1", type=float, default=0.0, help="Momentum for SGD; beta1-like parameter.")
+    p.add_argument("--quant_mode", type=str, default="none", choices=["none", "qat"])
+    p.add_argument("--target_infer_dtype", type=str, default="int8", choices=["int8", "fp8_e4m3fn"])
+    p.add_argument("--quant_scope", type=str, default="linear_only",
+                   choices=["linear_only", "attn_mlp_linear", "all_linear_plus_lm_head"])
+    p.add_argument("--quant_exclude", type=str, default="embed_tokens,norm,softmax")
+    p.add_argument("--qat_start_ratio", type=float, default=0.10)
+    p.add_argument("--qat_freeze_observer_ratio", type=float, default=0.80)
+    p.add_argument("--weight_granularity", type=str, default="per_channel", choices=["per_tensor", "per_channel"])
+    p.add_argument("--act_granularity", type=str, default="per_tensor", choices=["per_tensor", "per_token"])
+    p.add_argument("--int8_group_size", type=int, default=128)
+    p.add_argument("--export_format", type=str, default="hf", choices=["hf"])
+    p.add_argument("--export_quantized", type=str, default="auto", choices=["auto", "true", "false"])
+    p.add_argument("--export_dir", type=str, default=None)
+    p.add_argument("--export_fallback_dtype", type=str, default="bf16",
+                   choices=["float32", "fp32", "bfloat16", "bf16", "float16", "fp16"])
 
     # misc
     p.add_argument("--single_gpu", action="store_true", default=False, help="Disable torch.distributed, run single GPU.")
@@ -270,6 +488,7 @@ def parse_args(argv=None) -> argparse.Namespace:
 
     args = p.parse_args(argv)
     args = args_utils.check_args_torchrun_main(args)
+    normalize_precision_runtime_args(args)
 
     # batch derivation
     if args.total_batch_size is not None and args.gradient_accumulation is None:
@@ -386,9 +605,84 @@ def build_model(args: argparse.Namespace, model_config: Any) -> torch.nn.Module:
 
 
 def move_model_to_device(args: argparse.Namespace, model: torch.nn.Module, device: torch.device) -> torch.nn.Module:
-    if args.dtype in ["bf16", "bfloat16"]:
-        return model.to(device=device, dtype=torch.bfloat16)
-    return model.to(device=device)
+    master_dtype = torch_dtype_from_name(args.master_weight_dtype)
+    return model.to(device=device, dtype=master_dtype)
+
+
+def get_autocast_context(args: argparse.Namespace, device: torch.device):
+    if (not args.amp) or args.compute_dtype == "fp32":
+        return contextlib.nullcontext()
+    if device.type != "cuda":
+        return contextlib.nullcontext()
+    compute_dtype = torch_dtype_from_name(args.compute_dtype)
+    return torch.autocast(device_type="cuda", dtype=compute_dtype)
+
+
+def should_qat_wrap_linear(module_name: str, args: argparse.Namespace) -> bool:
+    if any(token in module_name for token in args.quant_exclude_list):
+        return False
+
+    if args.quant_scope == "attn_mlp_linear":
+        return (".self_attn." in module_name) or (".mlp." in module_name)
+    if args.quant_scope == "linear_only":
+        return not module_name.endswith("lm_head")
+    return True
+
+
+def get_parent_module(root: nn.Module, module_name: str) -> Tuple[nn.Module, str]:
+    parts = module_name.split(".")
+    parent = root
+    for p in parts[:-1]:
+        parent = getattr(parent, p)
+    return parent, parts[-1]
+
+
+def wrap_model_for_qat(model: nn.Module, args: argparse.Namespace) -> int:
+    if args.quant_mode != "qat":
+        return 0
+    targets: List[str] = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear) and should_qat_wrap_linear(name, args):
+            targets.append(name)
+
+    for name in targets:
+        parent, child_name = get_parent_module(model, name)
+        original = getattr(parent, child_name)
+        wrapped = QATLinear(
+            original,
+            act_granularity=args.act_granularity,
+            weight_granularity=args.weight_granularity,
+        )
+        setattr(parent, child_name, wrapped)
+    return len(targets)
+
+
+def set_qat_state(model: nn.Module, args: argparse.Namespace, update_step: int) -> None:
+    if args.quant_mode != "qat":
+        return
+    start_step = int(args.qat_start_ratio * args.num_training_steps)
+    freeze_step = int(args.qat_freeze_observer_ratio * args.num_training_steps)
+    enabled = update_step >= start_step
+    observer_enabled = update_step < freeze_step
+    for module in model.modules():
+        if isinstance(module, QATLinear):
+            module.set_qat_state(enabled=enabled, observer_enabled=observer_enabled)
+
+
+def convert_qat_to_linear_for_export(model: nn.Module) -> int:
+    replaced = 0
+    targets: List[str] = []
+    for name, module in model.named_modules():
+        if isinstance(module, QATLinear):
+            targets.append(name)
+
+    for name in targets:
+        parent, child_name = get_parent_module(model, name)
+        wrapped = getattr(parent, child_name)
+        exported = wrapped.export_as_linear()
+        setattr(parent, child_name, exported)
+        replaced += 1
+    return replaced
 
 
 def maybe_wrap_ddp(args: argparse.Namespace, model: torch.nn.Module, local_rank: int) -> torch.nn.Module:
@@ -460,7 +754,8 @@ def evaluate_model(
         labels = batch["input_ids"].clone()
         labels[labels == pad_idx] = -100
 
-        loss = model(**batch, labels=labels).loss
+        with get_autocast_context(args, device):
+            loss = model(**batch, labels=labels).loss
         total_loss += loss.detach()
         total_batches += 1
 
@@ -497,6 +792,7 @@ def save_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: Any,
+    scaler: Optional[torch.cuda.amp.GradScaler],
     pruner: Optional[Any],
     run_config: Dict[str, Any],
     global_step: int,
@@ -519,12 +815,16 @@ def save_checkpoint(
     opt_payload = {
         "optimizer": optimizer.state_dict(),
         "scheduler": getattr(scheduler, "state_dict", lambda: {})(),
+        "scaler": scaler.state_dict() if scaler is not None else None,
         "dst_scheduler": pruner.state_dict() if (pruner is not None and hasattr(pruner, "state_dict")) else None,
         "update_step": update_step,
         "global_step": global_step,
         "config": run_config,
         "wandb_dir": wandb.run.dir if wandb.run is not None else None,
         "dtype": args.dtype,
+        "compute_dtype": args.compute_dtype,
+        "master_weight_dtype": args.master_weight_dtype,
+        "grad_dtype": args.grad_dtype,
     }
     torch.save(opt_payload, os.path.join(out_dir, "optimizer.pt"))
 
@@ -550,6 +850,7 @@ def load_checkpoint_if_needed(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: Any,
+    scaler: Optional[torch.cuda.amp.GradScaler],
     pruner: Optional[Any],
 ) -> Tuple[int, int, int, int]:
     """
@@ -597,6 +898,12 @@ def load_checkpoint_if_needed(
         except Exception as e:
             logger.warning(f"Failed to restore scheduler state: {e}")
 
+    if scaler is not None and opt_payload.get("scaler") is not None:
+        try:
+            scaler.load_state_dict(opt_payload["scaler"])
+        except Exception as e:
+            logger.warning(f"Failed to restore AMP scaler state: {e}")
+
     if args.dst_scheduler and pruner is not None and opt_payload.get("dst_scheduler") is not None:
         try:
             pruner.load_state_dict(opt_payload["dst_scheduler"])
@@ -635,7 +942,9 @@ def main(args: argparse.Namespace) -> None:
     os.makedirs(args.save_dir, exist_ok=True)
 
     # Prevent accidental overwrite of final export dir
-    final_export_dir = os.path.join("trained_model", f"galore-{args.dataset_name}-{model_name}_{args.run_name}")
+    final_export_dir = args.export_dir or os.path.join(
+        "trained_model", f"galore-{args.dataset_name}-{model_name}_{args.run_name}"
+    )
     if rank0_only() and os.path.exists(final_export_dir):
         logger.warning(f"Final export dir exists: {final_export_dir}. Will not overwrite; exiting.")
         safe_barrier()
@@ -685,16 +994,38 @@ def main(args: argparse.Namespace) -> None:
     if getattr(args, "activation_checkpointing", False) and hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
 
+    qat_wrapped_modules = wrap_model_for_qat(model, args)
+    if args.quant_mode == "qat":
+        logger.info(f"QAT enabled: wrapped {qat_wrapped_modules} Linear modules")
+        set_qat_state(model, args, update_step=0)
+
     # optimizer
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    if args.optimizer == "adam":
-        optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
-    elif args.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
-    elif args.optimizer == "sgd":
-        optimizer = torch.optim.SGD(trainable_params, lr=args.lr, weight_decay=args.weight_decay, momentum=args.beta1)
+    if args.optimizer_state_dtype == "int8":
+        try:
+            import bitsandbytes as bnb
+        except Exception as e:
+            raise RuntimeError("optimizer_state_dtype=int8 requires bitsandbytes to be importable") from e
+
+        if args.optimizer == "adam":
+            optimizer = bnb.optim.Adam8bit(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+        elif args.optimizer == "adamw":
+            optimizer = bnb.optim.AdamW8bit(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+        else:
+            raise ValueError(f"Unsupported optimizer for int8 states: {args.optimizer}")
     else:
-        raise ValueError(f"Unsupported optimizer: {args.optimizer}")
+        if args.optimizer == "adam":
+            optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+        elif args.optimizer == "adamw":
+            optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+        elif args.optimizer == "sgd":
+            optimizer = torch.optim.SGD(trainable_params, lr=args.lr, weight_decay=args.weight_decay, momentum=args.beta1)
+        else:
+            raise ValueError(f"Unsupported optimizer: {args.optimizer}")
+
+    scaler = None
+    if args.use_grad_scaler:
+        scaler = torch.cuda.amp.GradScaler(enabled=True)
 
     # scheduler (keep your training_utils call, but add fallback)
     try:
@@ -741,8 +1072,9 @@ def main(args: argparse.Namespace) -> None:
 
     # load checkpoint if needed (before DDP wrap)
     global_step, update_step, tokens_seen, tokens_seen_before = load_checkpoint_if_needed(
-        args, model, optimizer, scheduler, pruner
+        args, model, optimizer, scheduler, scaler, pruner
     )
+    set_qat_state(model, args, update_step=update_step)
 
     # DDP
     model = maybe_wrap_ddp(args, model, local_rank)
@@ -795,27 +1127,46 @@ def main(args: argparse.Namespace) -> None:
             logger.info(f"Reached num_training_steps={args.num_training_steps}; stopping.")
             break
 
+        base_model_for_qat = model.module if hasattr(model, "module") else model
+        set_qat_state(base_model_for_qat, args, update_step=update_step)
+
         batch = {k: v.to(device) for k, v in batch.items()}
         labels = batch["input_ids"].clone()
         labels[labels == pad_idx] = -100
 
         tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
 
-        loss = model(**batch, labels=labels).loss
-        (loss / args.gradient_accumulation).backward()
+        with get_autocast_context(args, device):
+            loss = model(**batch, labels=labels).loss
+        loss_for_backward = loss / args.gradient_accumulation
+
+        if scaler is not None:
+            scaler.scale(loss_for_backward).backward()
+        else:
+            loss_for_backward.backward()
 
         if global_step % args.gradient_accumulation != 0:
             continue
 
         # UPDATE STEP
         if args.grad_clipping > 0:
+            if scaler is not None:
+                scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping)
 
         if args.dst_scheduler and pruner is not None:
             if pruner():
-                optimizer.step()
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
         else:
-            optimizer.step()
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
 
         scheduler.step()
         optimizer.zero_grad(set_to_none=True)
@@ -833,6 +1184,7 @@ def main(args: argparse.Namespace) -> None:
                 model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
+                scaler=scaler,
                 pruner=pruner,
                 run_config=run_config,
                 global_step=global_step,
@@ -902,8 +1254,22 @@ def main(args: argparse.Namespace) -> None:
 
     # export pretrained format (rank0)
     if rank0_only():
-        os.makedirs(os.path.dirname(final_export_dir), exist_ok=True)
         base_model = model.module if hasattr(model, "module") else model
+        export_quantized = args.export_quantized == "true" or (
+            args.export_quantized == "auto" and args.quant_mode == "qat"
+        )
+
+        if export_quantized and args.quant_mode == "qat":
+            replaced = convert_qat_to_linear_for_export(base_model)
+            logger.info(f"Converted {replaced} QAT Linear modules for HF export")
+
+        if args.target_infer_dtype.startswith("fp8"):
+            fallback_dtype = torch_dtype_from_name(args.export_fallback_dtype)
+            base_model.to(dtype=fallback_dtype)
+
+        export_parent = os.path.dirname(final_export_dir)
+        if export_parent:
+            os.makedirs(export_parent, exist_ok=True)
         base_model.save_pretrained(final_export_dir)
         tokenizer.save_pretrained(final_export_dir)
         logger.info(f"Saved final model to: {final_export_dir}")

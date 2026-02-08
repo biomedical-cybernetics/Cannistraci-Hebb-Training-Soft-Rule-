@@ -26,7 +26,4 @@ def check_args_torchrun_main(args):
     if args.continue_from is not None:
         assert os.path.exists(args.continue_from), f"--continue_from={args.continue_from} does not exist"
 
-    if args.dtype in ["fp16", "float16"]:
-        raise NotImplementedError("fp16 is not supported in torchrun_main.py. Use deepspeed_main.py instead (but it seems to have bugs)")
-
     return args
