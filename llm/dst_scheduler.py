@@ -322,6 +322,7 @@ class DSTScheduler:
         For attention q/k/v projections, record num_heads and per-head row span so that
         remove/regrow can run independently per head.
         """
+        enable_per_head = bool(getattr(self.args, "attn_qkv_per_head_dst", False))
         meta: List[Dict[str, Any]] = []
         for w in self.W:
             meta.append({
@@ -366,7 +367,7 @@ class DSTScheduler:
             if n_heads <= 0:
                 n_heads = model_heads
 
-            if n_heads > 0 and row_dim % n_heads == 0:
+            if enable_per_head and n_heads > 0 and row_dim % n_heads == 0:
                 meta[idx]["per_head"] = True
                 meta[idx]["num_heads"] = n_heads
                 meta[idx]["head_rows"] = row_dim // n_heads

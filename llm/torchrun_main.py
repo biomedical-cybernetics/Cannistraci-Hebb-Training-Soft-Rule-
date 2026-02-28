@@ -150,6 +150,8 @@ def build_run_name(args: argparse.Namespace) -> str:
         suffix += f"_rm_{rm}"
 
     suffix += f"_rg_{args.regrow_method}_cr_{args.chain_removal}"
+    if args.attn_qkv_per_head_dst:
+        suffix += "_qkv_per_head"
 
     if args.gmp:
         suffix += f"_gmp_{args.granet_init_sparsity}_{args.sparsity_distribution}"
@@ -235,6 +237,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--regrow_method", type=str, default="random")
     p.add_argument("--init_mode", type=str, default="xavier")
     p.add_argument("--chain_removal", action="store_true", default=False)
+    p.add_argument(
+        "--attn_qkv_per_head_dst",
+        action="store_true",
+        default=False,
+        help="Apply DST link remove/regrow for attention q/k/v per head instead of full matrix.",
+    )
     p.add_argument("--T_decay", type=str, default="no_decay")
     p.add_argument("--adaptive_zeta", action="store_true", default=False)
 
