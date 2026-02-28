@@ -636,8 +636,9 @@ def main(args: argparse.Namespace) -> None:
 
     # Prevent accidental overwrite of final export dir
     final_export_dir = os.path.join("trained_model", f"galore-{args.dataset_name}-{model_name}_{args.run_name}")
-    if rank0_only() and os.path.exists(final_export_dir):
-        logger.warning(f"Final export dir exists: {final_export_dir}. Will not overwrite; exiting.")
+    if os.path.exists(final_export_dir):
+        if rank0_only():
+            logger.warning(f"Final export dir exists: {final_export_dir}. Will not overwrite; exiting.")
         safe_barrier()
         if log_file is not None:
             sys.stdout = sys.__stdout__

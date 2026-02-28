@@ -198,6 +198,7 @@ class DSTScheduler:
 
         # collect weights and chain relations
         self.W, self.chain_list, self.qk_chain_list = get_W(model, args)
+        self.layer_meta = self._build_layer_meta(model)
 
         self.N = [w.numel() for w in self.W]
 
@@ -314,6 +315,148 @@ class DSTScheduler:
         self.backward_masks = sd["backward_masks"]
 
     # --------- helpers ---------
+
+    def _build_layer_meta(self, model: torch.nn.Module) -> List[Dict[str, Any]]:
+        """
+        Build per-layer metadata from modules annotated by dst_util.get_W(..., annotate_modules=True).
+        For attention q/k/v projections, record num_heads and per-head row span so that
+        remove/regrow can run independently per head.
+        """
+        meta: List[Dict[str, Any]] = []
+        for w in self.W:
+            meta.append({
+                "name": "",
+                "kind": "",
+                "per_head": False,
+                "num_heads": 1,
+                "head_rows": int(w.shape[0]),
+            })
+
+        modules_by_name = dict(model.named_modules())
+        model_heads = int(getattr(getattr(model, "config", None), "num_attention_heads", 0) or 0)
+
+        for full_name, mod in model.named_modules():
+            if not isinstance(mod, torch.nn.Linear):
+                continue
+            if not hasattr(mod, "LAYER_INDEX"):
+                continue
+
+            idx = int(getattr(mod, "LAYER_INDEX"))
+            if idx < 0 or idx >= len(meta):
+                continue
+
+            kind = full_name.split(".")[-1]
+            row_dim = int(mod.weight.shape[0])
+
+            meta[idx]["name"] = full_name
+            meta[idx]["kind"] = kind
+            meta[idx]["head_rows"] = row_dim
+
+            if kind not in ("q_proj", "k_proj", "v_proj"):
+                continue
+
+            parent_name = ".".join(full_name.split(".")[:-1])
+            parent = modules_by_name.get(parent_name, None)
+
+            n_heads = 0
+            if parent is not None:
+                n_heads = int(getattr(parent, "num_heads", 0) or 0)
+                if n_heads <= 0:
+                    n_heads = int(getattr(parent, "num_key_value_heads", 0) or 0)
+            if n_heads <= 0:
+                n_heads = model_heads
+
+            if n_heads > 0 and row_dim % n_heads == 0:
+                meta[idx]["per_head"] = True
+                meta[idx]["num_heads"] = n_heads
+                meta[idx]["head_rows"] = row_dim // n_heads
+
+        return meta
+
+    def _is_attention_qkv_layer(self, layer_idx: int) -> bool:
+        info = self.layer_meta[layer_idx]
+        return bool(info.get("per_head", False))
+
+    def _head_row_slices(self, layer_idx: int, n_rows: int) -> List[slice]:
+        """
+        Return row slices for per-head processing.
+        Non q/k/v layers return a single full-matrix slice.
+        """
+        info = self.layer_meta[layer_idx]
+        if not bool(info.get("per_head", False)):
+            return [slice(0, n_rows)]
+
+        n_heads = int(info.get("num_heads", 1))
+        head_rows = int(info.get("head_rows", n_rows))
+        if n_heads <= 0 or head_rows <= 0 or n_heads * head_rows != n_rows:
+            return [slice(0, n_rows)]
+
+        return [slice(h * head_rows, (h + 1) * head_rows) for h in range(n_heads)]
+
+    def _paired_head_slices(
+        self,
+        layer_a: int,
+        layer_b: int,
+        rows_a: int,
+        rows_b: int,
+    ) -> Optional[List[Tuple[slice, slice]]]:
+        """
+        Return per-head paired row slices for q/k chain-removal when both layers
+        are attention q/k/v projections with matching head count.
+        """
+        info_a = self.layer_meta[layer_a]
+        info_b = self.layer_meta[layer_b]
+        if not (bool(info_a.get("per_head", False)) and bool(info_b.get("per_head", False))):
+            return None
+
+        n_heads_a = int(info_a.get("num_heads", 1))
+        n_heads_b = int(info_b.get("num_heads", 1))
+        head_rows_a = int(info_a.get("head_rows", rows_a))
+        head_rows_b = int(info_b.get("head_rows", rows_b))
+        if n_heads_a <= 0 or n_heads_a != n_heads_b:
+            return None
+        if n_heads_a * head_rows_a != rows_a or n_heads_b * head_rows_b != rows_b:
+            return None
+
+        out: List[Tuple[slice, slice]] = []
+        for h in range(n_heads_a):
+            sa = slice(h * head_rows_a, (h + 1) * head_rows_a)
+            sb = slice(h * head_rows_b, (h + 1) * head_rows_b)
+            out.append((sa, sb))
+        return out
+
+    @staticmethod
+    def _topk_keep_mask(score: torch.Tensor, n_keep: int) -> torch.Tensor:
+        flat = score.reshape(-1)
+        if n_keep <= 0:
+            return torch.zeros_like(score, dtype=torch.bool)
+        if n_keep >= flat.numel():
+            return torch.ones_like(score, dtype=torch.bool)
+
+        _, keep_idx = torch.topk(flat, k=n_keep, largest=True, sorted=False)
+        out = torch.zeros_like(flat, dtype=torch.bool)
+        out[keep_idx] = True
+        return out.view_as(score)
+
+    @staticmethod
+    def _soft_sample_keep_mask(score: torch.Tensor, n_keep: int, temperature: float) -> torch.Tensor:
+        flat = (score.reshape(-1).clamp_min(1e-12)) ** temperature
+        n_keep = min(max(0, int(n_keep)), int(flat.numel()))
+        if n_keep <= 0:
+            return torch.zeros_like(score, dtype=torch.bool)
+        if n_keep >= flat.numel():
+            return torch.ones_like(score, dtype=torch.bool)
+
+        s = flat.sum()
+        if not torch.isfinite(s).item() or float(s.item()) <= 0.0:
+            keep_idx = torch.randperm(flat.numel(), device=flat.device)[:n_keep]
+        else:
+            probs = flat / s
+            keep_idx = torch.multinomial(probs, n_keep, replacement=False)
+
+        out = torch.zeros_like(flat, dtype=torch.bool)
+        out[keep_idx] = True
+        return out.view_as(score)
 
     def should_accumulate_dense_grad(self) -> bool:
         if self.step >= self.T_end:
@@ -673,70 +816,77 @@ class DSTScheduler:
                 drop_fraction = float(self.alpha)
 
             current_mask = self.backward_masks[l]
-            n_ones = int(current_mask.sum().item())
-            n_prune = int(n_ones * drop_fraction)
-            n_keep = max(0, n_ones - n_prune)
 
             # Score weights (global average if dist)
-            score = w.detach().abs()
+            score_abs = w.detach().abs()
             if self.is_dist:
-                tmp = score.clone()
+                tmp = score_abs.clone()
                 dist.all_reduce(tmp)
-                score = tmp / self.world_size
+                score_abs = tmp / self.world_size
 
             method = str(getattr(self.args, "remove_method", "weight_magnitude"))
 
-            if method in ("weight_magnitude", "ri", "MEST"):
-                # compute score_drop depending on method
-                if method == "ri":
-                    eps = 1e-5
-                    score = score / (score.sum(dim=0) + eps) + score / (score.sum(dim=1).view(-1, 1) + eps)
-                elif method == "MEST":
-                    hook = self.backward_hook_objects[l]
-                    if hook is not None and hook.dense_grad is not None:
-                        grow = hook.dense_grad.abs()
-                        if self.is_dist:
-                            tmp = grow.clone()
-                            dist.all_reduce(tmp)
-                            grow = tmp / self.world_size
-                        score = score + float(getattr(self.args, "factor", 0.01)) * (grow.abs() * current_mask)
+            score_grow = None
+            if method == "MEST":
+                hook = self.backward_hook_objects[l]
+                if hook is not None and hook.dense_grad is not None:
+                    score_grow = hook.dense_grad.abs()
+                    if self.is_dist:
+                        tmp = score_grow.clone()
+                        dist.all_reduce(tmp)
+                        score_grow = tmp / self.world_size
 
-                flat = score.view(-1)
-                if n_keep <= 0:
-                    new_flat = torch.zeros_like(flat, dtype=torch.bool)
-                elif n_keep >= flat.numel():
-                    new_flat = torch.ones_like(flat, dtype=torch.bool)
-                else:
-                    _, keep_idx = torch.topk(flat, k=n_keep, largest=True, sorted=False)
-                    new_flat = torch.zeros_like(flat, dtype=torch.bool)
-                    new_flat[keep_idx] = True
-
-                new_mask = new_flat.view_as(current_mask)
-
-            elif method.endswith("_soft"):
-                # soft sampling proportional to score^T
-                if method.startswith("weight_magnitude"):
-                    score_drop = score
-                elif method.startswith("ri"):
-                    eps = 1e-5
-                    score_drop = score / (score.sum(dim=0) + eps) + score / (score.sum(dim=1).view(-1, 1) + eps)
-                else:
-                    raise NotImplementedError(f"Unknown soft remove_method: {method}")
-
+            if method.endswith("_soft"):
                 T0 = float(getattr(self.args, "start_T", 1.0))
                 T1 = float(getattr(self.args, "end_T", 1.0))
                 T = T0 + self.step * ((T1 - T0) / max(1, self.T_end))
-
-                flat = (score_drop.flatten().clamp_min(1e-12)) ** T
-                probs = flat / flat.sum()
-                keep_idx = torch.multinomial(probs, max(1, n_keep), replacement=False)
-
-                new_flat = torch.zeros_like(flat, dtype=torch.bool)
-                new_flat[keep_idx] = True
-                new_mask = new_flat.view_as(current_mask)
-
             else:
-                raise NotImplementedError(f"Unknown remove_method: {method}")
+                T = 1.0
+
+            new_mask = torch.zeros_like(current_mask, dtype=torch.bool)
+            for row_slice in self._head_row_slices(l, current_mask.shape[0]):
+                head_mask = current_mask[row_slice, :]
+                head_score_abs = score_abs[row_slice, :]
+
+                head_n_ones = int(head_mask.sum().item())
+                head_n_prune = int(head_n_ones * drop_fraction)
+                head_n_keep = max(0, head_n_ones - head_n_prune)
+
+                if method in ("weight_magnitude", "ri", "MEST"):
+                    if method == "ri":
+                        eps = 1e-5
+                        head_score = (
+                            head_score_abs / (head_score_abs.sum(dim=0) + eps)
+                            + head_score_abs / (head_score_abs.sum(dim=1).view(-1, 1) + eps)
+                        )
+                    elif method == "MEST" and score_grow is not None:
+                        head_score = head_score_abs + float(getattr(self.args, "factor", 0.01)) * (
+                            score_grow[row_slice, :].abs() * head_mask
+                        )
+                    else:
+                        head_score = head_score_abs
+
+                    head_new = self._topk_keep_mask(head_score, head_n_keep)
+
+                elif method.endswith("_soft"):
+                    if method.startswith("weight_magnitude"):
+                        head_score_drop = head_score_abs
+                    elif method.startswith("ri"):
+                        eps = 1e-5
+                        head_score_drop = (
+                            head_score_abs / (head_score_abs.sum(dim=0) + eps)
+                            + head_score_abs / (head_score_abs.sum(dim=1).view(-1, 1) + eps)
+                        )
+                    else:
+                        raise NotImplementedError(f"Unknown soft remove_method: {method}")
+
+                    # keep behavior consistent with old code: soft branch keeps at least one link.
+                    head_new = self._soft_sample_keep_mask(head_score_drop, max(1, head_n_keep), T)
+
+                else:
+                    raise NotImplementedError(f"Unknown remove_method: {method}")
+
+                new_mask[row_slice, :] = head_new
 
             self.backward_masks[l] = new_mask.to(device=w.device, dtype=torch.bool)
 
@@ -746,7 +896,19 @@ class DSTScheduler:
             ma, mb = self.backward_masks[a], self.backward_masks[b]
             if ma is None or mb is None:
                 continue
-            self.backward_masks[a], self.backward_masks[b] = qk_chain_removal(ma, mb)
+
+            paired_slices = self._paired_head_slices(a, b, ma.shape[0], mb.shape[0])
+            if paired_slices is None:
+                self.backward_masks[a], self.backward_masks[b] = qk_chain_removal(ma, mb)
+                continue
+
+            ma_new = ma.clone()
+            mb_new = mb.clone()
+            for sa, sb in paired_slices:
+                qa, kb = qk_chain_removal(ma[sa, :], mb[sb, :])
+                ma_new[sa, :] = qa
+                mb_new[sb, :] = kb
+            self.backward_masks[a], self.backward_masks[b] = ma_new, mb_new
 
         for a, b in self.chain_list:
             ma, mb = self.backward_masks[a], self.backward_masks[b]
@@ -776,7 +938,7 @@ class DSTScheduler:
                 current_nnz = int(self.backward_masks[l].sum().item())
                 n_regrow = target_nnz - current_nnz
 
-            if n_regrow <= 0:
+            if n_regrow <= 0 and (not self._is_attention_qkv_layer(l)):
                 continue
 
             current_mask = self.backward_masks[l].clone()
@@ -786,18 +948,45 @@ class DSTScheduler:
             scores = scores * (~current_mask)  # only consider zero positions
 
             # select top-k positions
-            flat = scores.view(-1)
-            num_candidates = int((~current_mask).sum().item())
-            k = min(max(1, int(n_regrow)), max(1, num_candidates))
+            new_links = torch.zeros_like(current_mask, dtype=torch.bool)
+            if self._is_attention_qkv_layer(l):
+                # q/k/v regrow independently per head
+                for row_slice in self._head_row_slices(l, current_mask.shape[0]):
+                    head_mask = current_mask[row_slice, :]
+                    head_scores = scores[row_slice, :]
 
-            if k >= flat.numel():
-                grow_flat = flat > -1  # all True
+                    head_target_nnz = int((1.0 - self.S[l]) * head_mask.numel())
+                    head_current_nnz = int(head_mask.sum().item())
+                    head_regrow = head_target_nnz - head_current_nnz
+                    if head_regrow <= 0:
+                        continue
+
+                    head_flat = head_scores.reshape(-1)
+                    head_candidates = int((~head_mask).sum().item())
+                    if head_candidates <= 0:
+                        continue
+
+                    k = min(max(1, int(head_regrow)), max(1, head_candidates))
+                    if k >= head_flat.numel():
+                        head_grow_flat = head_flat > -1  # all True
+                    else:
+                        _, idx = torch.topk(head_flat, k=k, largest=True, sorted=False)
+                        head_grow_flat = torch.zeros_like(head_flat, dtype=torch.bool)
+                        head_grow_flat[idx] = True
+                    new_links[row_slice, :] = head_grow_flat.view_as(head_mask)
             else:
-                _, idx = torch.topk(flat, k=k, largest=True, sorted=False)
-                grow_flat = torch.zeros_like(flat, dtype=torch.bool)
-                grow_flat[idx] = True
+                flat = scores.view(-1)
+                num_candidates = int((~current_mask).sum().item())
+                k = min(max(1, int(n_regrow)), max(1, num_candidates))
 
-            new_links = grow_flat.view_as(current_mask)
+                if k >= flat.numel():
+                    grow_flat = flat > -1  # all True
+                else:
+                    _, idx = torch.topk(flat, k=k, largest=True, sorted=False)
+                    grow_flat = torch.zeros_like(flat, dtype=torch.bool)
+                    grow_flat[idx] = True
+                new_links = grow_flat.view_as(current_mask)
+
             self.backward_masks[l] = (current_mask | new_links)
 
             if self.is_dist:
@@ -825,63 +1014,91 @@ class DSTScheduler:
         if "ch" in method:
             # Expect patterns like "CH2_L3n", "CH3_L3p", etc. (case-insensitive)
             ch_method = method.split("_")[0].upper()
-            if "l3n" in method:
-                dt = current_mask.float()
-                td = dt.transpose(1, 0)
-
-                dd2 = dt @ td
-                tt2 = td @ dt
-
-                bdd2 = dd2 != 0
-                btt2 = tt2 != 0
-
-                elcl_dt = (dt.sum(dim=1) - dd2) * bdd2
-                elcl_td = (td.sum(dim=1) - tt2) * btt2
-
-                elcl_dt = elcl_dt.clamp_min(1) - 1
-                elcl_td = elcl_td.clamp_min(1) - 1
-
-                if ch_method == "CH2":
-                    elcl_dt = (dd2 + bdd2) / (elcl_dt + 1)
-                    elcl_td = (tt2 + btt2) / (elcl_td + 1)
-                elif ch_method == "CH3":
-                    elcl_dt = bdd2 / (elcl_dt + 1)
-                    elcl_td = btt2 / (elcl_td + 1)
-                elif ch_method == "CH3.1":
-                    elcl_dt = (dd2 + bdd2) / ((elcl_dt + 1) ** (1 + (elcl_dt / (1 + elcl_dt))))
-                    elcl_td = (tt2 + btt2) / ((elcl_td + 1) ** (1 + (elcl_td / (1 + elcl_td))))
-                else:
-                    raise NotImplementedError(f"Unsupported CH method: {ch_method}")
-
-                elcl_dt = elcl_dt @ dt
-                elcl_td = elcl_td @ td
-                return (elcl_dt + elcl_td.transpose(1, 0)).to(w.device)
-
-            if "l3p" in method:
-                if CH_scores is None:
-                    raise ImportError("CH_scores is required for *_L3p regrow_method but could not be imported.")
-
-                xb = current_mask.detach().cpu().numpy()
-                x = transform_bi_to_mo(xb)
-                A = csr_matrix(x)
-                ir, jc = A.indices, A.indptr
-
-                if ch_method == "CH2":
-                    sc = CH_scores.CH_scores_new_v2(ir, jc, x.shape[0], [3], 1, 3, [2], 1)
-                elif ch_method == "CH3":
-                    sc = CH_scores.CH_scores_new_v2(ir, jc, x.shape[0], [3], 1, 3, [3], 1)
-                elif ch_method == "CH3.1":
-                    sc = CH_scores.CH_scores_new_v2(ir, jc, x.shape[0], [3], 1, 3, [5], 1)
-                else:
-                    raise NotImplementedError(f"Unsupported CH method: {ch_method}")
-
-                scores = torch.tensor(np.array(sc), device=w.device).view(*x.shape)
-                scores = scores[: xb.shape[0], xb.shape[0] :]
+            if self._is_attention_qkv_layer(layer_idx):
+                scores = torch.zeros_like(w)
+                for row_slice in self._head_row_slices(layer_idx, current_mask.shape[0]):
+                    head_scores = self._scores_for_regrowth_ch(
+                        method=method,
+                        ch_method=ch_method,
+                        current_mask=current_mask[row_slice, :],
+                        w=w[row_slice, :],
+                    )
+                    scores[row_slice, :] = head_scores
                 return scores
 
-            raise NotImplementedError(f"Unsupported CH regrow_method variant: {method}")
+            return self._scores_for_regrowth_ch(
+                method=method,
+                ch_method=ch_method,
+                current_mask=current_mask,
+                w=w,
+            )
 
         raise NotImplementedError(f"Unknown regrow_method: {method}")
+
+    @torch.no_grad()
+    def _scores_for_regrowth_ch(
+        self,
+        *,
+        method: str,
+        ch_method: str,
+        current_mask: Mask,
+        w: torch.Tensor,
+    ) -> torch.Tensor:
+        if "l3n" in method:
+            dt = current_mask.float()
+            td = dt.transpose(1, 0)
+
+            dd2 = dt @ td
+            tt2 = td @ dt
+
+            bdd2 = dd2 != 0
+            btt2 = tt2 != 0
+
+            elcl_dt = (dt.sum(dim=1) - dd2) * bdd2
+            elcl_td = (td.sum(dim=1) - tt2) * btt2
+
+            elcl_dt = elcl_dt.clamp_min(1) - 1
+            elcl_td = elcl_td.clamp_min(1) - 1
+
+            if ch_method == "CH2":
+                elcl_dt = (dd2 + bdd2) / (elcl_dt + 1)
+                elcl_td = (tt2 + btt2) / (elcl_td + 1)
+            elif ch_method == "CH3":
+                elcl_dt = bdd2 / (elcl_dt + 1)
+                elcl_td = btt2 / (elcl_td + 1)
+            elif ch_method == "CH3.1":
+                elcl_dt = (dd2 + bdd2) / ((elcl_dt + 1) ** (1 + (elcl_dt / (1 + elcl_dt))))
+                elcl_td = (tt2 + btt2) / ((elcl_td + 1) ** (1 + (elcl_td / (1 + elcl_td))))
+            else:
+                raise NotImplementedError(f"Unsupported CH method: {ch_method}")
+
+            elcl_dt = elcl_dt @ dt
+            elcl_td = elcl_td @ td
+            return (elcl_dt + elcl_td.transpose(1, 0)).to(w.device)
+
+        if "l3p" in method:
+            if CH_scores is None:
+                raise ImportError("CH_scores is required for *_L3p regrow_method but could not be imported.")
+
+            xb = current_mask.detach().cpu().numpy()
+            x = transform_bi_to_mo(xb)
+            A = csr_matrix(x)
+            ir, jc = A.indices, A.indptr
+
+            if ch_method == "CH2":
+                sc = CH_scores.CH_scores_new_v2(ir, jc, x.shape[0], [3], 1, 3, [2], 1)
+            elif ch_method == "CH3":
+                sc = CH_scores.CH_scores_new_v2(ir, jc, x.shape[0], [3], 1, 3, [3], 1)
+            elif ch_method == "CH3.1":
+                sc = CH_scores.CH_scores_new_v2(ir, jc, x.shape[0], [3], 1, 3, [5], 1)
+            else:
+                raise NotImplementedError(f"Unsupported CH method: {ch_method}")
+
+            scores = torch.tensor(np.array(sc), device=w.device).view(*x.shape)
+            scores = scores[: xb.shape[0], xb.shape[0] :]
+            return scores
+
+        raise NotImplementedError(f"Unsupported CH regrow_method variant: {method}")
 
     # -----------------------------
     # Optional init reset
