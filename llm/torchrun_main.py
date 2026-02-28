@@ -21,7 +21,7 @@ import argparse
 import traceback
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -51,6 +51,8 @@ from utils import *  # noqa: F403,F401
 from dst_scheduler import DSTScheduler
 
 transformers.logging.set_verbosity_error()
+
+_VAL_DATA_CACHE: Dict[str, Any] = {}
 
 
 # -------------------------
@@ -186,6 +188,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--model_config", type=str, required=True)
     p.add_argument("--dataset_name", type=str, required=True, choices=["openwebtext", "c4"])
     p.add_argument("--dataset_path", type=str, default="openwebtext", help="Used if dataset_name=openwebtext")
+    p.add_argument("--hf_max_retries", type=int, default=20, help="Max retries for Hugging Face dataset HTTP errors.")
+    p.add_argument("--hf_retry_base_sleep", type=float, default=3.0, help="Base backoff seconds for HF retries.")
     p.add_argument("--use_hf_model", action="store_true", default=False)
     p.add_argument("--continue_from", type=str, default=None)
     p.add_argument("--tags", type=str, default=None)
@@ -337,20 +341,114 @@ def setup_distributed(args: argparse.Namespace) -> Tuple[int, int, int, torch.de
 # Data / Model
 # -------------------------
 
+def _is_hf_429_error(err: Exception) -> bool:
+    resp = getattr(err, "response", None)
+    if resp is not None and int(getattr(resp, "status_code", 0) or 0) == 429:
+        return True
+    msg = str(err).lower()
+    return ("429" in msg) and ("too many requests" in msg or "rate limit" in msg)
+
+
+def _load_with_retry(
+    args: argparse.Namespace,
+    *,
+    desc: str,
+    load_fn: Callable[[], Any],
+) -> Any:
+    retries = max(1, int(getattr(args, "hf_max_retries", 20)))
+    base_sleep = max(0.1, float(getattr(args, "hf_retry_base_sleep", 3.0)))
+    last_err: Optional[Exception] = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            return load_fn()
+        except Exception as e:
+            last_err = e
+            if attempt >= retries:
+                raise
+
+            wait = min(90.0, base_sleep * (2 ** min(6, attempt - 1)))
+            wait += random.uniform(0.0, 1.5) + 0.2 * float(get_rank() % 8)
+            kind = "HF 429 rate-limit" if _is_hf_429_error(e) else "dataset load error"
+            if rank0_only():
+                logger.warning(
+                    f"{kind} while loading {desc}; attempt {attempt}/{retries}, "
+                    f"sleep {wait:.1f}s, err={type(e).__name__}: {e}"
+                )
+            time.sleep(wait)
+
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError(f"Failed to load dataset: {desc}")
+
+
+def _load_dataset_ddp_safe(
+    args: argparse.Namespace,
+    *,
+    desc: str,
+    loader: Callable[[bool], Any],
+) -> Any:
+    """
+    DDP-safe dataset load:
+    - rank0 does online fetch first
+    - other ranks wait, then try local cache only
+    - if local cache is unavailable, fallback to online retry
+    """
+    if args.single_gpu or not is_dist_initialized():
+        return _load_with_retry(args, desc=desc, load_fn=lambda: loader(False))
+
+    sync_device = torch.device(f"cuda:{torch.cuda.current_device()}") if torch.cuda.is_available() else torch.device("cpu")
+    status = torch.zeros(1, dtype=torch.int32, device=sync_device)
+
+    if rank0_only():
+        try:
+            ds = _load_with_retry(args, desc=f"{desc} [rank0]", load_fn=lambda: loader(False))
+            status.fill_(1)
+        except Exception:
+            status.fill_(0)
+            dist.broadcast(status, 0)
+            raise
+        dist.broadcast(status, 0)
+        return ds
+
+    dist.broadcast(status, 0)
+    if int(status.item()) != 1:
+        raise RuntimeError(f"Rank0 failed while loading dataset: {desc}")
+
+    try:
+        return _load_with_retry(
+            args,
+            desc=f"{desc} [rank{get_rank()} local-cache]",
+            load_fn=lambda: loader(True),
+        )
+    except Exception:
+        return _load_with_retry(
+            args,
+            desc=f"{desc} [rank{get_rank()} fallback-online]",
+            load_fn=lambda: loader(False),
+        )
+
+
 def load_train_data(args: argparse.Namespace) -> Any:
     if args.dataset_name == "openwebtext":
-        ds = datasets.load_dataset(args.dataset_path, split="train", trust_remote_code=True)
+        def _loader(local_files_only: bool):
+            kwargs: Dict[str, Any] = {"split": "train", "trust_remote_code": True}
+            if local_files_only:
+                kwargs["download_config"] = datasets.DownloadConfig(local_files_only=True)
+            return datasets.load_dataset(args.dataset_path, **kwargs)
+
+        ds = _load_dataset_ddp_safe(args, desc=f"{args.dataset_path}:train", loader=_loader)
         ds = ds.train_test_split(test_size=0.05, seed=args.seed)
         return ds, ds["train"]
     elif args.dataset_name == "c4":
-        while True:
-            try:
-                train = datasets.load_dataset("allenai/c4", "en", split="train", trust_remote_code=True)
-                return None, train
-            except Exception as e:
-                if rank0_only():
-                    print(f"Error loading dataset: {e}")
-                time.sleep(3)
+        def _loader(local_files_only: bool):
+            kwargs: Dict[str, Any] = {"split": "train", "trust_remote_code": True}
+            if local_files_only:
+                kwargs["download_config"] = datasets.DownloadConfig(local_files_only=True)
+            return datasets.load_dataset("allenai/c4", "en", **kwargs)
+
+        train = _load_dataset_ddp_safe(args, desc="allenai/c4:train", loader=_loader)
+        return None, train
     raise ValueError(f"Unknown dataset_name: {args.dataset_name}")
 
 
@@ -359,14 +457,19 @@ def load_val_data(args: argparse.Namespace, train_valid_data: Any) -> Any:
         assert train_valid_data is not None
         return train_valid_data["test"], ["text"]
     elif args.dataset_name == "c4":
-        while True:
-            try:
-                val = datasets.load_dataset("allenai/c4", "en", split="validation", trust_remote_code=True)
-                return val, ["text", "timestamp", "url"]
-            except Exception as e:
-                if rank0_only():
-                    print(f"Error loading validation dataset: {e}")
-                time.sleep(5)
+        cache_key = "allenai/c4:validation"
+        if cache_key in _VAL_DATA_CACHE:
+            return _VAL_DATA_CACHE[cache_key], ["text", "timestamp", "url"]
+
+        def _loader(local_files_only: bool):
+            kwargs: Dict[str, Any] = {"split": "validation", "trust_remote_code": True}
+            if local_files_only:
+                kwargs["download_config"] = datasets.DownloadConfig(local_files_only=True)
+            return datasets.load_dataset("allenai/c4", "en", **kwargs)
+
+        val = _load_dataset_ddp_safe(args, desc="allenai/c4:validation", loader=_loader)
+        _VAL_DATA_CACHE[cache_key] = val
+        return val, ["text", "timestamp", "url"]
     raise ValueError(f"Unknown dataset_name: {args.dataset_name}")
 
 
